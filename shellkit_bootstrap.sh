@@ -1,42 +1,47 @@
-# test if we can have a key to checkout shellkit
-source shellkit.conf
+#!/usr/bin/env bash
+#
+# shellkit.bootstrap.sh – bezpečné inicializační skriptování
 
-_git_clone_or_fetch_local(){
-  # skip any git operations
-  if [[ "$SHELLKIT_GIT_CHECKOUT" -eq 0 ]];then
-    return
-  fi
+set -euo pipefail
 
-  # basic check to see if repo already exists
-  if [[ -d ${SHELLKIT_LOCAL_PATH}/.git ]];then
-    git -C $SHELLKIT_LOCAL_PATH reset --hard
-    # fetch new branches
-    git -C $SHELLKIT_LOCAL_PATH fetch --all
-    git -C $SHELLKIT_LOCAL_PATH checkout $SHELLKIT_TAG
-    git -C $SHELLKIT_LOCAL_PATH pull --no-edit
-  else
-    git clone $SHELLKIT_GIT_URL $SHELLKIT_LOCAL_PATH
-    git -C $SHELLKIT_LOCAL_PATH checkout $SHELLKIT_TAG
+# --- Nastavení prostředí ---
+export SHELLKIT_HOME="${SHELLKIT_HOME:-$HOME/.shellkit}"
+export PATH="$SHELLKIT_HOME/bin:$PATH"
+
+# --- Kontrola závislostí ---
+for dep in git curl jq gpg sha256sum; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    echo "❌ Missing dependency: $dep"
+    exit 1
   fi
+done
+
+# --- Stažení/aktualizace shellkit ---
+if [ ! -d "$SHELLKIT_HOME" ]; then
+  echo "📦 Installing shellkit..."
+  git clone https://github.com/shellkit/shellkit "$SHELLKIT_HOME"
+else
+  echo "🔄 Updating shellkit..."
+  git -C "$SHELLKIT_HOME" pull --ff-only
+fi
+
+# --- Ověření GPG podpisu ---
+echo "🔐 Verifying GPG signature..."
+git -C "$SHELLKIT_HOME" verify-commit HEAD || {
+  echo "❌ GPG verification failed!"
+  exit 1
 }
 
-_shellkit_source(){
+# --- Ověření checksumy ---
+echo "🔐 Verifying checksums..."
+if [ -f "$SHELLKIT_HOME/CHECKSUMS.sha256" ]; then
+  sha256sum -c "$SHELLKIT_HOME/CHECKSUMS.sha256" || {
+    echo "❌ Checksum verification failed!"
+    exit 1
+  }
+fi
 
-  for shellkit in $SHELLKIT_PATHS;do
-    if [[ -d $shellkit ]];then
-      source $shellkit/profile.d/shellkit.sh
-      break
-    fi
-  done
-}
+# --- Aktivace ---
+source "$SHELLKIT_HOME/lib/shellkit.sh"
 
-fatal(){ echo "failed to load shellkit" ; exit 1; }
-
-###################################################################
-
-_git_clone_or_fetch_local
-
-_shellkit_source
-
-# test function that is part of shellkit, if it fails to run we exit
-sk-test-true > /dev/null || fatal
+echo "✅ Shellkit bootstrapped securely at $SHELLKIT_HOME"
