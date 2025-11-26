@@ -1,91 +1,61 @@
-name: rel_tag
-
-permissions:
-  checks: write
-  contents: write # needed to create a gh release and tag repo
-  issues: read
-  pull-requests: write
+name: Create Real Git Tag & Changelog
 
 on:
-  workflow_call:
-    inputs:
-      version_tag:
-        description: 'version tag to use(vx.x.x)'
-        required: false
-        default: "latest"
-        type: string
-      bump:
-        description: 'whether to bump the version number by a major minor patch amount or try gitlog'
-        required: false
-        default: "patch"
-        type: string
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
-
   workflow_dispatch:
     inputs:
-      version_tag:
-        description: 'Version tag to use: (bump must also be set to none to keep a specific version'
-        required: false
-        default: 'latest'
-        type: string
-      bump:
-        description: |
-          How to optionally bump the semver version ( Major.Minor.Patch ) : git log will be searched for
-          '#major #minor #patch' or feat/ or fix/ branch names to optionally override the bump. Set to none to keep a specific version
-        required: false
-        options:
-          - patch
-          - minor
-          - major
-          - none
-        type: choice
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
+      version:
+        description: "Version number (e.g. 1.2.3)"
+        required: true
+  push:
+    branches: [ main ]
 
-
-
+permissions:
+  contents: write
 
 jobs:
-  rel_tag:
+  create_tag:
+    name: Create Git Tag & Release
     runs-on: ubuntu-latest
     steps:
-      - name: git-checkout-ref-action
-        id: ref
-        uses: ORCID/git-checkout-ref-action@main
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          default_branch: ${{ github.event.repository.default_branch }}
-          ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - uses: actions/checkout@v4
-        with:
-          # token with write permissions to protected branches
-          # standard github token does not allow this
-          token: ${{ secrets.RELEASE_TOKEN }}
-          ref: ${{ steps.ref.outputs.ref }}
-          # checkout some history so we can build a changelog and release
-          # NOTE: history does not include tags!
-          fetch-depth: 100
-
-      - name: find next version
+      - name: Determine Version
         id: version
-        uses: ORCID/version-bump-action@main
-        with:
-          version_tag: ${{ inputs.version_tag }}
-          bump: ${{ inputs.bump }}
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # fallback: semver bump based on commit messages
+            echo "version=$(npx semantic-release --dry-run | grep 'next release version' | awk '{print $NF}')" >> $GITHUB_OUTPUT
+          fi
 
-      - name: tag repo create changelog and create release
-        uses: ORCID/changelog-action@main
-        with:
-          version_tag: ${{ steps.version.outputs.version_tag }}
-          slack_channel: tech-release
-          github_write_token: ${{ secrets.RELEASE_TOKEN }}
-          slacktee_token: ${{ secrets.SLACKTEE_TOKEN }}
+      - name: Create Tag
+        run: |
+          git tag v${{ steps.version.outputs.version }}
+          git push origin v${{ steps.version.outputs.version }}
 
+      - name: Generate Changelog
+        run: |
+          npm install -g conventional-changelog-cli
+          conventional-changelog -p angular -r 1 > CHANGELOG.md
+
+      - name: Commit Changelog
+        run: |
+          git add CHANGELOG.md
+          git commit -m "docs: update changelog for v${{ steps.version.outputs.version }}" || echo "No changes"
+          git push || echo "No push (fork or no changes)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          body_path: CHANGELOG.md
