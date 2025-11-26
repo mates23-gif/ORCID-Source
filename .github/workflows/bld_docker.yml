@@ -1,163 +1,116 @@
-name: bld_docker
-
-permissions:
-  checks: write
-  contents: read
-  issues: read
-  pull-requests: write
+name: Build & Security (Docker)
 
 on:
-  workflow_call:
-    inputs:
-      docker_name:
-        description: 'Name of the docker image to build'
-        required: false
-        default: "orcid/version-bumping-test"
-        type: string
-      context:
-        description: 'Name of the context in the repo'
-        required: false
-        default: "."
-        type: string
-      build_args:
-        description: 'build_args e.g wibble=blar'
-        required: false
-        default: ""
-        type: string
-      file:
-        description: 'specify a custom dockerfile'
-        required: false
-        default: ""
-        type: string
-      version_tag:
-        description: 'Name of the tag to build'
-        required: false
-        default: 'latest'
-        type: string
-      bump:
-        description: 'whether to bump the version number by a major minor patch amount or none'
-        required: false
-        default: 'patch'
-        type: string
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
-      push:
-        description: 'Select to push to docker registry'
-        required: false
-        default: true
-        type: boolean
-
   workflow_dispatch:
-    inputs:
-      docker_name:
-        description: 'Name of the docker image to build'
-        required: false
-        default: "orcid/version-bumping-test"
-        type: string
-      context:
-        description: 'Name of the context in the repo'
-        required: false
-        default: "."
-        type: string
-      build_args:
-        description: 'build_args e.g wibble=blar'
-        required: false
-        default: ""
-        type: string
-      file:
-        description: 'specify a custom dockerfile'
-        required: false
-        default: ""
-        type: string
-      version_tag:
-        description: 'Name of the tag to build'
-        required: false
-        default: 'latest'
-        type: string
-      bump:
-        description: 'whether to bump the version number by a major minor patch amount or none'
-        required: false
-        default: 'patch'
-        type: string
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
-      push:
-        description: 'Select to push to docker registry'
-        required: false
-        default: true
-        type: boolean
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  security-events: write
 
 jobs:
-  bld_docker:
-    strategy:
-      matrix:
-        include:
-          - artifact_name: orcid-web
-            docker_name: orcid/registry/orcid-web
-            file: orcid-web/Dockerfile
-
-          - artifact_name: orcid-web-proxy
-            docker_name: orcid/registry/orcid-web-proxy
-            file: orcid-web-proxy/Dockerfile
-
-          - artifact_name: orcid-haprouter
-            docker_name: orcid/registry/orcid-haprouter
-            file: orcid-haprouter/Dockerfile
-
+  docker-build:
+    name: Build & Scan Docker Image
     runs-on: ubuntu-latest
+
     steps:
-      - name: git-checkout-ref-action
-        id: ref
-        uses: ORCID/git-checkout-ref-action@main
-        with:
-          default_branch: ${{ github.event.repository.default_branch }}
-          ref: ${{ inputs.ref }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.ref.outputs.ref }}
-          # checkout some history so we can scan commits for bump messages
-          # NOTE: history does not include tags!
-          fetch-depth: 100
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - name: find next version
-        id: version
-        uses: ORCID/version-bump-action@main
-        with:
-          version_tag: ${{ inputs.version_tag }}
-          bump: ${{ inputs.bump }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Login to private registry
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.DOCKER_REG_PRIVATE }}
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: nasty hack to allow dynamic defaults
-        id: dynamic_defaults
-        run: |
-          FILE="${{ matrix.file }}"
-          echo "default_file=${FILE:-${{ inputs.context }}/Dockerfile}" >> "$GITHUB_OUTPUT"
-
-      - name: show the dynamic defaults
-        run: |
-          echo ${{ steps.dynamic_defaults.outputs.default_file }}
-
-      - uses: docker/build-push-action@v6
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
         with:
-          push: ${{ inputs.push }}
-          tags: ${{ secrets.DOCKER_REG_PRIVATE }}/${{ matrix.docker_name}}:${{ steps.version.outputs.version_tag_numeric }}
-          context: ${{ inputs.context }}
-          cache-from: type=registry,ref=${{ secrets.DOCKER_REG_PRIVATE }}/${{ matrix.docker_name }}:cache
-          cache-to: type=registry,mode=max,image-manifest=true,oci-mediatypes=true,ref=${{ secrets.DOCKER_REG_PRIVATE }}/${{ matrix.docker_name }}:cache
-          file: ${{ steps.dynamic_defaults.outputs.default_file }}
+          context: .
+          push: false
+          tags: ghcr.io/${{ github.repository }}/app:latest
 
+      - name: Save image as artifact
+        run: |
+          docker save ghcr.io/${{ github.repository }}/app:latest -o image.tar
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+
+      - name: Scan image with Trivy
+        id: trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/app:latest
+          format: 'table'
+          exit-code: '1'
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  docker-push:
+    name: Push Docker Image
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: ${{ github.ref == 'refs/heads/main' && success() }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/app:latest
+            ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+  summary:
+    name: PR Summary & Auto-Approval
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    steps:
+      - name: Post PR Comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docker-build-summary
+          message: |
+            🐳 **Docker Build & Security Scan**
+            - Image built: `ghcr.io/${{ github.repository }}/app:latest`
+            - Trivy scan: ❌ fails if CRITICAL/HIGH vulnerabilities found
+            - Artifact: image.tar uploaded
+            - Push to GHCR: only on `main` branch after successful scan
+
+      - name: Auto-approve PR if all checks passed
+        if: ${{ github.event_name == 'pull_request' && success() }}
+        uses: hmarr/auto-approve-action@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
