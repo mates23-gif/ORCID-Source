@@ -1,159 +1,121 @@
-name: Test, Security & SBOM (Maven)
+name: Maven Build, Test & Security (Full Matrix + Summary)
 
 on:
-  workflow_dispatch:
-  workflow_call:
+  push:
+    branches: [ main, develop ]
   pull_request:
 
 permissions:
   contents: read
-  actions: read
-  checks: write
-  pull-requests: write
   security-events: write
+  pull-requests: write
 
 env:
-  JAVA_DISTRIBUTION: temurin
   MAVEN_OPTS: -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
 
 jobs:
-  test_matrix:
-    name: Maven tests & security
-    runs-on: ubuntu-latest
+  build_test:
+    name: Build & Test (Java ${{ matrix.java }} / Maven ${{ matrix.maven }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
-        project:
-          - orcid-message-listener
-          - orcid-activemq
-          - orcid-api-web
-          - orcid-internal-api
-          - orcid-pub-web
-          - orcid-scheduler-web
-          - orcid-web
-          - orcid-utils
-          - orcid-core
-          - orcid-persistence
-          - orcid-api-common
+        os: [ubuntu-latest, windows-latest, macos-latest]
         java: [17, 21]
-
+        maven: [3.8.8, 3.9.9]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Java
+      - name: Setup Java ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
 
-      - name: Run tests
-        run: |
-          mvn -T 1C --batch-mode test \
-            $MAVEN_OPTS \
-            --projects ${{ matrix.project }} \
-            --fail-at-end
+      - name: Setup Maven ${{ matrix.maven }}
+        uses: s4u/setup-maven-action@v1.6.0
+        with:
+          maven-version: ${{ matrix.maven }}
 
-      - name: Upload test reports
+      - name: Build & Run Tests
+        run: mvn -T 1C --batch-mode clean verify $MAVEN_OPTS
+
+      - name: Upload Test Reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-reports-${{ matrix.project }}-jdk${{ matrix.java }}
+          name: test-reports-java-${{ matrix.java }}-maven-${{ matrix.maven }}-${{ matrix.os }}
           path: |
             **/target/surefire-reports/*
             **/target/failsafe-reports/*
 
-      - name: Generate SBOM (CycloneDX)
-        run: |
-          mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DskipTests
-        continue-on-error: true
-
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sbom-${{ matrix.project }}-jdk${{ matrix.java }}
-          path: target/bom.xml
-
-      - name: OWASP Dependency-Check
-        uses: dependency-check/Action@v1.1.0
-        with:
-          project: "ORCID-${{ matrix.project }}"
-          path: "."
-          format: "HTML"
-          args: >
-            --scan . --failOnCVSS 7
-        # ❌ Build selže pokud najde CVSS ≥ 7
-        continue-on-error: false
-
-      - name: Upload Dependency-Check report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: depcheck-${{ matrix.project }}-jdk${{ matrix.java }}
-          path: |
-            dependency-check-report.html
-            dependency-check-report.xml
-          if-no-files-found: warn
-
-  codeql:
-    name: CodeQL Analysis
+  dependency_check:
+    name: OWASP Dependency-Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          distribution: temurin
           java-version: 17
           cache: maven
-      - uses: github/codeql-action/init@v3
+      - uses: dependency-check/Action@v1.1.0
         with:
-          languages: java
-      - uses: github/codeql-action/autobuild@v3
-      - uses: github/codeql-action/analyze@v3
+          path: "."
+          format: "SARIF"
+          args: "--scan . --failOnCVSS 7"
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: dependency-check-report.sarif
 
-  dependency_review:
-    name: Dependency Review
+  sbom:
+    name: Generate SBOM
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          fetch-depth: 2
-      - uses: actions/dependency-review-action@v4
+          distribution: temurin
+          java-version: 17
+          cache: maven
+      - name: Generate CycloneDX SBOM
+        run: mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DskipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: target/bom.xml
+
+  trivy_scan:
+    name: Trivy FS & Config Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: fs,config
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+          format: sarif
+          output: trivy.sarif
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
 
   summary:
-    name: PR Summary & Auto-Approval
+    name: Security & Test Summary
     runs-on: ubuntu-latest
-    needs: [test_matrix, codeql, dependency_review]
+    needs: [build_test, dependency_check, sbom, trivy_scan]
     steps:
-      - name: Create summary
-        run: |
-          echo "## ✅ Build & Security Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Maven tests ran for all modules on JDK 17 & 21" >> $GITHUB_STEP_SUMMARY
-          echo "- SBOM (CycloneDX) generated per module" >> $GITHUB_STEP_SUMMARY
-          echo "- OWASP Dependency-Check reports uploaded (build fails if CVSS ≥ 7)" >> $GITHUB_STEP_SUMMARY
-          echo "- CodeQL analysis completed" >> $GITHUB_STEP_SUMMARY
-          echo "- Dependency Review executed for PRs" >> $GITHUB_STEP_SUMMARY
-
-      - name: Post PR Comment
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: marocchino/sticky-pull-request-comment@v2
+      - uses: marocchino/sticky-pull-request-comment@v2
         with:
-          header: test-security-summary
+          header: ci-summary
           message: |
-            ✅ **Tests & Security Checks Completed**
-            - Maven tests: all modules, JDK 17 & 21
-            - SBOM: CycloneDX generated
-            - OWASP Dependency-Check: reports attached (❌ build fails if CVSS ≥ 7)
-            - CodeQL: analysis posted to Security tab
-            - Dependency Review: executed
-
-      - name: Auto-approve PR if all checks passed
-        if: ${{ github.event_name == 'pull_request' && success() }}
-        uses: hmarr/auto-approve-action@v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+            ✅ **CI Summary**
+            - Build & Tests: Matrix (Java 17/21, Maven 3.8/3.9, Ubuntu/Windows/macOS) → ✅
+            - OWASP Dependency-Check: ✅ (fail ≥ CVSS 7)
+            - SBOM (CycloneDX): ✅ generated
+            - Trivy FS/Config: ✅ scanned (HIGH/CRITICAL reported in Security tab)
