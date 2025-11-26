@@ -1,30 +1,124 @@
-name: pushmain
+name: CI/CD on Main Push
 
 on:
   push:
-    branches:
-      - main
-    # Ignore changes that are made as part of the rel_tag workflow to avoid infinite loop
-    paths-ignore:
-      - CHANGELOG.md
-    # Ignore workflow changes
-      - '.github/**'
-    # Ignore changes that are made as part of the rel_tag workflow to avoid infinite loop
-    tags-ignore:
-      - '**'
+    branches: [ main ]
 
-# if multiple prs get merged they will wait for each job to complete
-# so we don't get duplicate builds
-concurrency:
-  group: pushmain-${{ github.ref }}-1
-  cancel-in-progress: false
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  security-events: write
+
+env:
+  JAVA_DISTRIBUTION: temurin
+  JAVA_VERSION: "17"
+  MAVEN_OPTS: -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
 
 jobs:
-  build_test_release_tag:
-    uses: ./.github/workflows/build_test_release_tag.yml
-    secrets: inherit # pass all secrets for pushing
-    with:
-      # NOTE: passing in a specific branch means that commits made during the pipeline before the final build is completed will be included
-      #       the default is to always checkout the current commit that runs the pipeline in each job
-      ref: main
+  build_test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Build & Test
+        run: mvn -T 1C --batch-mode clean verify $MAVEN_OPTS
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-artifacts
+          path: target/*.jar
+
+      - name: Upload Test Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/*
+            **/target/failsafe-reports/*
+
+  security:
+    name: Security Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Action@v1.1.0
+        with:
+          project: "ORCID-Source"
+          path: "."
+          format: "HTML"
+          args: "--scan . --failOnCVSS 7"
+
+      - name: Upload Dependency-Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: depcheck
+          path: |
+            dependency-check-report.html
+            dependency-check-report.xml
+
+      - name: Generate SBOM (CycloneDX)
+        run: mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DskipTests
+        continue-on-error: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom
+          path: target/bom.xml
+
+      - name: CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    needs: [build_test, security]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Semantic Release (auto version bump)
+        uses: phips28/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.semantic.outputs.new_release_version }}
+          name: Release v${{ steps.semantic.outputs.new_release_version }}
+          body: |
+            🚀 Automated release from push to main
+            - Build & tests passed
+            - Security checks completed
+            - SBOM generated
+          files: |
+            target/*.jar
+            target/bom.xml
+            dependency-check-report.html
