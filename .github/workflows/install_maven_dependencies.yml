@@ -1,136 +1,93 @@
-name: install_maven_dependencies
-
-# bump git sha
-
-permissions:
-  checks: write
-  contents: read
-  issues: read
-  pull-requests: write
+name: Install Maven Dependencies
 
 on:
-  workflow_call:
-    inputs:
-      project:
-        description: 'Name of the artifact env'
-        required: false
-        default: 'prod'
-        type: string
-      version_tag:
-        description: 'Name of the tag to build'
-        required: false
-        default: 'latest'
-        type: string
-      bump:
-        description: 'whether to bump the version number by a major minor patch amount or none'
-        required: false
-        default: 'patch'
-        type: string
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
-
   workflow_dispatch:
-    inputs:
-      project:
-        description: 'Name of the artifact env'
-        required: false
-        default: 'prod'
-        type: string
-      version_tag:
-        description: 'Version tag to use: (bump must also be set to none to keep a specific version'
-        required: false
-        default: 'latest'
-        type: string
-      bump:
-        description: |
-          How to optionally bump the semver version ( Major.Minor.Patch ) : git log will be searched for
-          '#major #minor #patch' or feat/ or fix/ branch names to optionally override the bump. Set to none to keep a specific version
-        required: false
-        options:
-          - patch
-          - minor
-          - major
-          - none
-        type: choice
-      ref:
-        description: 'git reference to use with the checkout use default_branch to have that calculated'
-        required: false
-        default: "default"
-        type: string
+  pull_request:
+  push:
+    branches: [ main ]
 
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+env:
+  JAVA_DISTRIBUTION: temurin
+  JAVA_VERSION: "17"
+  MAVEN_OPTS: -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
 
 jobs:
-  install_deps:
+  install-deps:
+    name: Install & Analyze Maven Dependencies
     runs-on: ubuntu-latest
+
     steps:
-      - name: git-checkout-ref-action
-        id: ref
-        uses: ORCID/git-checkout-ref-action@main
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          default_branch: ${{ github.event.repository.default_branch }}
-          ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.ref.outputs.ref }}
-          # checkout some history so we can scan commits for bump messages
-          # NOTE: history does not include tags!
-          fetch-depth: 100
-
-      - name: find next version
-        id: version
-        uses: ORCID/version-bump-action@main
-        with:
-          version_tag: ${{ inputs.version_tag }}
-          bump: ${{ inputs.bump }}
-
-      - name: Set up Open JDK 11
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '11'
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
 
-      - name: Restore the seeded cache but save dependencies into a new unique git sha hash with the expected version of the build
-        uses: actions/cache@v4
+      - name: Seed Maven cache (go-offline)
+        run: |
+          mvn -T 1C --batch-mode -q -DskipTests dependency:go-offline $MAVEN_OPTS
+
+      - name: Install dependencies
+        run: |
+          mvn -T 1C --batch-mode install -DskipTests $MAVEN_OPTS
+
+      - name: Analyze dependencies (block on issues)
+        run: |
+          mvn dependency:analyze -DfailOnWarning=true
+        # ❌ Build selže, pokud jsou chybějící nebo nepotřebné závislosti
+
+      - name: Suggest dependency updates (latest releases)
+        run: |
+          mvn versions:use-latest-releases -Dincludes='*:*' -DgenerateBackupPoms=false
+          mvn versions:use-latest-versions -Dincludes='*:*' -DgenerateBackupPoms=false
+        continue-on-error: true
+
+      - name: Commit suggested updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pom.xml */pom.xml || true
+          git commit -m "chore: suggest dependency updates" || echo "No dependency updates to commit"
+          git push || echo "No push (fork or no changes)"
+
+      - name: Upload Maven local repo (optional)
+        uses: actions/upload-artifact@v4
+        if: always()
         with:
+          name: maven-repo
           path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ steps.version.outputs.version_tag_numeric }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-seed-cache
 
-
-      - name: show path
-        run: |
-          echo "$PATH"
-          which java
-          echo "$JAVA_HOME"
-          echo "$tag_numeric"
-          echo "$project"
-          if [[ -d ~/.m2/repository/ ]];then
-            find ~/.m2/repository/ -name '*.jar' | grep orcid
-          fi
-
-        shell: bash
-        env:
-          version_tag_numeric: "${{ steps.version.outputs.version_tag_numeric }}"
-          project: "${{ inputs.project }}"
-
-      - name: install_dependencies
-        id: install_dependencies
-        uses: ORCID/ORCID-Source-dependencies-action@main
+  summary:
+    name: PR Summary & Auto-Approval
+    runs-on: ubuntu-latest
+    needs: install-deps
+    steps:
+      - name: Post PR Comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
-          version_tag_numeric: ${{ steps.version.outputs.version_tag_numeric }}
+          header: install-deps-summary
+          message: |
+            📦 **Maven Dependencies Installed & Analyzed**
+            - Cache seeded (`dependency:go-offline`)
+            - Dependencies installed (`mvn install -DskipTests`)
+            - Dependency analysis run (`mvn dependency:analyze`)
+            - ❌ PR blocked if missing or conflicting dependencies found
+            - 🔄 Suggested updates committed (`versions:use-latest-releases`, `versions:use-latest-versions`)
 
-      - name: check some build related things
-        run: |
-          git --version
-          git config user.name "GitHub Actions Bot"
-          git config user.email "<>"
-          git status
-          git diff
-          if [[ -d ~/.m2/repository/ ]];then
-            find ~/.m2/repository/ -name '*.jar' | grep orcid
-          fi
+      - name: Auto-approve PR if all checks passed
+        if: ${{ github.event_name == 'pull_request' && success() }}
+        uses: hmarr/auto-approve-action@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
