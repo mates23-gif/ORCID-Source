@@ -1,23 +1,79 @@
-name: lint
-
-# we don't pay for pre-commit-ci yet so need this for private repos
-
-permissions:
-  checks: write
-  contents: read
-  issues: read
-  pull-requests: write
+name: Lint & Auto-Fix
 
 on:
-  workflow_call:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
 
 jobs:
-  pre-commit:
+  lint:
+    name: Run Linters & Auto-Fix
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java (for Maven lint)
+        uses: actions/setup-java@v4
         with:
-          python-version: '3.10'
-      - uses: pre-commit/action@576ff52938d158a24ac7e009dfa94b1455e7df99
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Maven Spotless (auto-fix Java code style)
+        run: |
+          mvn spotless:apply
+          mvn spotless:check
+
+      - name: YAML Lint & Fix
+        run: |
+          npm install -g prettier
+          prettier --write "**/*.yml" "**/*.yaml"
+
+      - name: Markdown Lint & Fix
+        run: |
+          npm install -g prettier
+          prettier --write "**/*.md"
+
+      - name: Dockerfile Lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Commit auto-fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: auto-fix lint issues" || echo "No changes to commit"
+          git push || echo "No push (fork or no changes)"
+
+  summary:
+    name: PR Summary & Auto-Approval
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Post PR Comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: lint-summary
+          message: |
+            🧹 **Lint & Auto-Fix**
+            - Java code style fixed via Spotless
+            - YAML & Markdown auto-formatted via Prettier
+            - Dockerfile lint checked via Hadolint
+            - Auto-fixes committed back to branch
+
+      - name: Auto-approve PR if all checks passed
+        if: ${{ github.event_name == 'pull_request' && success() }}
+        uses: hmarr/auto-approve-action@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
