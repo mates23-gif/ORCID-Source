@@ -241,5 +241,3 @@ jobs:
           ARTIFACT_USER: "${{ secrets.ARTIFACT_USER }}"
           ARTIFACT_PASSWORD: "${{ secrets.ARTIFACT_PASSWORD }}"
           project: "${{ matrix.project }}"
-
-
